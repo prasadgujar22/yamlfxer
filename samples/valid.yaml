@@ -1,0 +1,21 @@
+name: my-app
+version: "1.0.0"
+description: A sample application
+
+server:
+  host: localhost
+  port: 8080
+  tls: false
+
+database:
+  host: db.example.com
+  port: 5432
+  name: mydb
+  pool:
+    min: 2
+    max: 10
+
+tags:
+  - web
+  - api
+  - production
