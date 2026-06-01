@@ -5,6 +5,7 @@ Validates YAML input and attempts to auto-correct common mistakes.
 """
 
 import sys
+import os
 import re
 import argparse
 import textwrap
@@ -72,17 +73,73 @@ def fix_tabs(text: str, result: ValidationResult) -> str:
     return "".join(out)
 
 
+def _protected_lines(text: str) -> set[int]:
+    """
+    Return the set of 0-indexed line numbers that live inside a block scalar
+    (`key: |` or `key: >`).  Content inside block scalars is literal text and
+    must never be touched by the colon/quoting correctors.
+    """
+    lines = text.split("\n")
+    protected: set[int] = set()
+    key_block_re = re.compile(r'^(\s*)(?:[\w\-\.\"\']+|-)\s*:?\s*[|>][+\-]?\d*\s*(?:#.*)?$')
+    i, n = 0, len(lines)
+    while i < n:
+        m = key_block_re.match(lines[i])
+        if m:
+            indent = len(m.group(1))
+            j = i + 1
+            while j < n:
+                content = lines[j]
+                if content.strip() == "":
+                    protected.add(j)
+                    j += 1
+                    continue
+                cur_indent = len(content) - len(content.lstrip(" "))
+                if cur_indent > indent:
+                    protected.add(j)
+                    j += 1
+                else:
+                    break
+            i = j
+        else:
+            i += 1
+    return protected
+
+
 def fix_missing_space_after_colon(text: str, result: ValidationResult) -> str:
-    """Add space after colon in key:value pairs where missing."""
-    pattern = re.compile(r'^(\s*[\w\-\.]+):([^\s\n\r/])', re.MULTILINE)
-    def replacer(m):
-        return m.group(1) + ": " + m.group(2)
-    new_text, n = pattern.subn(replacer, text)
-    if n:
+    """
+    Add a space after the colon in `key:value` pairs where it is missing.
+
+    Operates line by line (skipping block-scalar content) so it can also flag
+    each occurrence as a warning — even when the document still parses as a
+    valid string (e.g. `foo:bar` parses as the string "foo:bar", not a mapping).
+    """
+    protected = _protected_lines(text)
+    lines = text.split("\n")
+    # key at line start, colon, then a non-space/non-slash char (slash avoids URLs)
+    pattern = re.compile(r'^(\s*)([\w\-\.]+):([^\s/])')
+    count = 0
+    for idx, line in enumerate(lines):
+        if idx in protected:
+            continue
+        m = pattern.match(line)
+        if not m:
+            continue
+        lines[idx] = pattern.sub(r'\1\2: \3', line, count=1)
+        count += 1
+        result.issues.append(Issue(
+            line=idx + 1,
+            column=len(m.group(1)) + len(m.group(2)) + 1,
+            severity="warning",
+            code="W005",
+            message=f"Missing space after colon in key '{m.group(2)}'",
+            suggestion="YAML needs a space after the colon, e.g. 'key: value'",
+        ))
+    if count:
         result.corrections_made.append(
-            f"Added missing space after colon in {n} key-value pair(s)"
+            f"Added missing space after colon in {count} key-value pair(s)"
         )
-    return new_text
+    return "\n".join(lines)
 
 
 def fix_trailing_whitespace(text: str, result: ValidationResult) -> str:
@@ -188,39 +245,41 @@ def fix_unquoted_colon_in_value(text: str, result: ValidationResult) -> str:
 
     Uses [^\n] instead of . to guarantee the pattern never spans lines.
     """
-    # Group 1: key + ": " prefix (no newline allowed inside)
-    # Group 2: the value (no newline allowed)
-    pattern = re.compile(r'^([ \t]*[\w\-\.]+[ \t]*:[ \t]+)([^\n]+)$', re.MULTILINE)
+    # Group 1: key + ": " prefix. Group 2: the value. Anchored per line.
+    pattern = re.compile(r'^([ \t]*[\w\-\.]+[ \t]*:[ \t]+)(.+)$')
 
-    def replacer(m):
-        val = m.group(2).strip()
-        # skip already-quoted, block scalars, booleans, nulls, numbers
+    def fix_value(prefix: str, value: str) -> Optional[str]:
+        val = value.strip()
+        # skip already-quoted, block scalars, booleans, nulls, numbers, comments
         if (val.startswith(('"', "'", '|', '>', '{', '[', '#'))
                 or val in ('true', 'false', 'null', 'True', 'False', 'Null',
                            '~', 'yes', 'no', 'on', 'off',
                            'YES', 'NO', 'ON', 'OFF', 'Yes', 'No', 'On', 'Off')
                 or re.match(r'^-?\d', val)):
-            return m.group(0)
+            return None
         # only quote if there's a colon-space sequence in the value
         if ': ' in val:
-            return m.group(1) + '"' + val.replace('\\', '\\\\').replace('"', '\\"') + '"'
-        return m.group(0)
+            return prefix + '"' + val.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        return None
 
+    protected = _protected_lines(text)
+    lines = text.split("\n")
     count = 0
-    def counting_replacer(m):
-        nonlocal count
-        original = m.group(0)
-        replaced = replacer(m)
-        if replaced != original:
+    for idx, line in enumerate(lines):
+        if idx in protected:
+            continue
+        m = pattern.match(line)
+        if not m:
+            continue
+        replaced = fix_value(m.group(1), m.group(2))
+        if replaced is not None:
+            lines[idx] = replaced
             count += 1
-        return replaced
-
-    new_text = pattern.sub(counting_replacer, text)
     if count:
         result.corrections_made.append(
             f"Quoted {count} value(s) that contained unescaped colons"
         )
-    return new_text
+    return "\n".join(lines)
 
 
 def fix_missing_newline_at_eof(text: str, result: ValidationResult) -> str:
@@ -325,58 +384,87 @@ def parse_yaml_error(exc: yaml.YAMLError) -> Issue:
     )
 
 
-def validate_and_correct(text: str) -> ValidationResult:
-    result = ValidationResult(valid=False)
-    working = text
-
-    # First pass: try to parse as-is
+def _parses(text: str) -> bool:
     try:
-        list(yaml.safe_load_all(working))
-        result.valid = True
-        lint(working, result)
-        # Still run non-destructive cosmetic fixes even on valid YAML
-        cosmetic = [fix_windows_newlines, fix_tabs, fix_trailing_whitespace, fix_missing_newline_at_eof]
-        for fix in cosmetic:
-            working = fix(working, result)
-        if result.corrections_made:
-            result.corrected_yaml = working
-        return result
+        list(yaml.safe_load_all(text))
+        return True
     except yaml.YAMLError:
-        pass
+        return False
 
-    # Correction loop — run all correctors up to MAX_ATTEMPTS times until
-    # the document parses cleanly.  We collect corrections_made in a local
-    # list and deduplicate at the end so repeated passes don't spam the log.
+
+def _cosmetic_only(text: str) -> tuple[str, list[str]]:
+    """Run only the safe, non-semantic fixes. Returns (text, corrections)."""
+    r = ValidationResult(valid=True)
+    working = text
+    for fix in (fix_windows_newlines, fix_tabs, fix_trailing_whitespace,
+                fix_missing_newline_at_eof):
+        working = fix(working, r)
+    return working, r.corrections_made
+
+
+def validate_and_correct(text: str) -> ValidationResult:
+    """
+    Validate YAML and build a corrected version.
+
+    The full corrector pipeline always runs — even when the input already
+    parses — so issues like `foo:bar` (a missing space that YAML silently
+    reads as the string "foo:bar") are still detected and fixed.  A safety
+    net guarantees we never hand back something worse than the input: if the
+    correctors would turn parseable YAML into unparseable YAML, we fall back
+    to cosmetic-only fixes.
+    """
+    result = ValidationResult(valid=False)
+    original_parses = _parses(text)
+
+    # Run all correctors, repeating until stable or MAX_ATTEMPTS reached.
+    working = text
     all_corrections: list[str] = []
     all_issues: list[Issue] = []
 
-    for attempt in range(MAX_ATTEMPTS):
+    for _ in range(MAX_ATTEMPTS):
         pass_result = ValidationResult(valid=False)
         for fix in CORRECTORS:
             working = fix(working, pass_result)
         all_corrections.extend(pass_result.corrections_made)
         all_issues.extend(i for i in pass_result.issues if i.severity != "error")
+        if not pass_result.corrections_made:
+            break  # stable — nothing more to fix
+        if _parses(working):
+            break  # parses cleanly, no need for more passes
 
-        try:
-            list(yaml.safe_load_all(working))
-            result.valid = True
-            result.corrections_made = _dedup_ordered(all_corrections)
-            result.issues = all_issues
-            lint(working, result)
+    corrected_parses = _parses(working)
+
+    # Case 1: the corrected text parses cleanly — best outcome.
+    if corrected_parses:
+        result.valid = True
+        result.corrections_made = _dedup_ordered(all_corrections)
+        result.issues = all_issues
+        lint(working, result)
+        if result.corrections_made:
             result.corrected_yaml = working
-            return result
-        except yaml.YAMLError:
-            pass  # keep trying
+        return result
 
-    # Failed to correct — report the final parse error
+    # Case 2: corrected text does NOT parse, but the original DID.
+    # A corrector broke valid YAML — fall back to cosmetic-only fixes.
+    if original_parses:
+        safe, safe_corrections = _cosmetic_only(text)
+        result.valid = True
+        result.corrections_made = safe_corrections
+        lint(safe, result)
+        if safe_corrections:
+            result.corrected_yaml = safe
+        return result
+
+    # Case 3: neither the original nor the corrected version parses.
+    # Report the parse error and still return the best-effort corrected text.
+    result.valid = False
     result.corrections_made = _dedup_ordered(all_corrections)
     result.issues = all_issues
     try:
         list(yaml.safe_load_all(working))
     except yaml.YAMLError as exc:
         result.issues.insert(0, parse_yaml_error(exc))
-
-    result.corrected_yaml = working  # return best-effort output anyway
+    result.corrected_yaml = working
     return result
 
 
@@ -403,7 +491,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent("""\
             examples:
               yaml-validator config.yaml
-              yaml-validator config.yaml --fix --output fixed.yaml
+              yaml-validator config.yaml --fix          # writes config.fixed.yaml
+              yaml-validator config.yaml --output clean.yaml
               cat broken.yaml | yaml-validator -
               yaml-validator *.yaml --summary
         """),
@@ -417,12 +506,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fix", "-f",
         action="store_true",
-        help="Write corrected YAML back to the original file (in-place).",
+        help="Write corrected YAML to a SEPARATE file (e.g. config.yaml → "
+             "config.fixed.yaml). The original file is never modified.",
     )
     p.add_argument(
         "--output", "-o",
         metavar="FILE",
-        help="Write corrected YAML to this file (only valid with a single input file).",
+        help="Write corrected YAML to this specific path instead of the "
+             "auto-named .fixed file (only valid with a single input file).",
     )
     p.add_argument(
         "--print-corrected", "-p",
@@ -513,15 +604,21 @@ def report_file(
     return bool(errors)
 
 
+def _fixed_path(path: str) -> str:
+    """Derive the separate output path for a fixed file: foo.yaml → foo.fixed.yaml."""
+    root, ext = os.path.splitext(path)
+    return f"{root}.fixed{ext or '.yaml'}"
+
+
 def process_file(
     label: str,
     text: str,
     args: argparse.Namespace,
     source_path: Optional[str] = None,
-) -> bool:
-    """Validate one file and handle output/fix flags. Returns True on error."""
+) -> ValidationResult:
+    """Validate one file and handle output/fix flags. Returns the result."""
     result = validate_and_correct(text)
-    has_errors = report_file(label, text, result, args)
+    report_file(label, text, result, args)
 
     corrected = result.corrected_yaml
 
@@ -531,20 +628,32 @@ def process_file(
         print(f"{'─' * 60}\n")
         print(corrected)
 
-    if corrected and args.output and source_path:
-        with open(args.output, "w", encoding="utf-8") as fh:
-            fh.write(corrected)
-        print(f"\n  Wrote corrected YAML → {args.output}")
-
-    if corrected and args.fix and source_path and source_path != "<stdin>":
-        if result.corrections_made:
-            with open(source_path, "w", encoding="utf-8") as fh:
-                fh.write(corrected)
-            print(f"  Fixed in-place: {source_path}")
+    # Decide whether to write a corrected file. We ALWAYS write to a separate
+    # file — the original is never modified.
+    if args.output or args.fix:
+        if not result.corrections_made:
+            print("\n  No changes needed — nothing to write.")
+        elif corrected is None:
+            print("\n  Could not produce a corrected version.")
         else:
-            print(f"  No changes needed: {source_path}")
+            if args.output:
+                out_path = args.output
+            elif source_path and source_path != "<stdin>":
+                out_path = _fixed_path(source_path)
+            else:
+                out_path = "fixed.yaml"  # stdin fallback
 
-    return has_errors
+            # Safety: never overwrite the original input file.
+            if (source_path and source_path != "<stdin>"
+                    and os.path.abspath(out_path) == os.path.abspath(source_path)):
+                out_path = _fixed_path(source_path)
+                print("\n  (refusing to overwrite the original — using a separate file)")
+
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write(corrected)
+            print(f"\n  Wrote corrected YAML → {out_path}")
+
+    return result
 
 
 def main() -> None:
@@ -565,7 +674,7 @@ def main() -> None:
     for path in args.files:
         if path == "-":
             text = sys.stdin.read()
-            had_error = process_file("<stdin>", text, args, source_path="<stdin>")
+            result = process_file("<stdin>", text, args, source_path="<stdin>")
         else:
             try:
                 with open(path, "r", encoding="utf-8") as fh:
@@ -578,14 +687,12 @@ def main() -> None:
                 print(red(f"  ✖ Cannot read {path}: {exc}", nc), file=sys.stderr)
                 any_errors = True
                 continue
-            had_error = process_file(path, text, args, source_path=path)
+            result = process_file(path, text, args, source_path=path)
 
-        if had_error:
+        if not result.valid:
             any_errors = True
-        elif args.strict:
-            result_tmp = validate_and_correct(text if path == "-" else open(path).read())
-            if any(i.severity == "warning" for i in result_tmp.issues):
-                any_errors = True
+        elif args.strict and any(i.severity == "warning" for i in result.issues):
+            any_errors = True
 
     if not args.summary:
         print()
