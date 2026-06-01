@@ -29,11 +29,12 @@ pip install pyyaml
 # Validate one or more files
 python validator.py config.yaml
 
-# Validate and fix in-place
+# Fix and write to a SEPARATE file (config.yaml -> config.fixed.yaml).
+# The original file is never modified.
 python validator.py config.yaml --fix
 
-# Save corrected output to a new file
-python validator.py config.yaml --output fixed.yaml
+# Write the corrected output to a specific path
+python validator.py config.yaml --output clean.yaml
 
 # Print corrected YAML to stdout
 python validator.py config.yaml --print-corrected
@@ -51,6 +52,9 @@ python validator.py config.yaml --no-color
 python validator.py config.yaml --strict
 ```
 
+> **Note:** `--fix` always writes to a **separate** file (`<name>.fixed.<ext>`)
+> and never overwrites your original. Use `--output` to choose the path.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -67,6 +71,7 @@ python validator.py config.yaml --strict
 | `W002` | warning | Duplicate key in same mapping block |
 | `W003` | warning | Value treated as boolean in YAML 1.1 |
 | `W004` | warning | Octal-looking integer |
+| `W005` | warning | Missing space after colon (`key:value`) |
 | `I001` | info    | Line longer than 120 characters |
 
 ## Example
@@ -78,9 +83,9 @@ name: broken-config
 version:1.2.3
 
 server:
-	host: localhost
-	port: 8080
-	tls: no
+        host: localhost
+        port: 8080
+        tls: no
 
 database:
   host: db.example.com   
