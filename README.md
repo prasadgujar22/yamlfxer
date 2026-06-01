@@ -30,12 +30,21 @@ A Python CLI tool that validates YAML files and auto-corrects common mistakes.
 > before using it.
 
 > **About missing colons:** YAML reads `name John` as the plain string
-> `"name John"`, not a broken mapping — so a missing colon can't be detected by
-> parsing alone. The tool flags one only when context shows a mapping was
-> intended: several colon-less `key value` lines share an indentation level, or
-> a properly-written `key: value` sibling sits at the same level. A lone
-> multi-word line (e.g. a real scalar value under a block key) is left untouched,
-> and the rewrite is applied only if the result still parses.
+> `"name John"` (and several such lines fold into a single scalar), so a missing
+> colon can't be detected by parsing alone. To stay safe, the tool rewrites a
+> colon-less `key value` line **only** when an explicit `key: value` mapping
+> sibling already exists at the *same indentation level* — proof that a mapping
+> was intended there. For example, in
+>
+> ```yaml
+> name: John
+> age 30      # ← fixed to "age: 30" because of the sibling above
+> ```
+>
+> A standalone block of colon-less lines (no `key: value` anchor), a real scalar
+> value under a block key, and lines whose value merely contains a colon are all
+> left untouched — they're indistinguishable from valid YAML. The rewrite is
+> additionally applied only if the result still parses.
 
 ## Installation
 
