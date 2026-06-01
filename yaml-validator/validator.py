@@ -521,11 +521,17 @@ def fix_missing_colon(text: str, result: ValidationResult) -> str:
     # after the colon (so "note Hello: world" is NOT counted as a mapping).
     mapping_re = re.compile(r'^(\s*)([\w\-\.\"\']+)\s*:(\s|$)')
     # A sequence item whose value is a mapping: "- key: value".  Such an item
-    # opens an inline mapping whose keys start at the column after "- ".
+    # opens an inline mapping whose keys start at the column after "- ", so a
+    # colon-less line indented beneath it (e.g. "  b 2") is an unambiguous
+    # mapping sibling and can be repaired.
+    #
+    # Note: a *standalone* colon-less item ("- a 1") is deliberately NOT a
+    # candidate.  A sequence may legitimately mix scalars and mappings
+    # (e.g. [{name: Bob}, "hello world"]), so "- hello world" alongside
+    # "- name: Bob" is a valid plain scalar — rewriting it to "- hello: world"
+    # would silently corrupt data, and it would still parse.  Only the
+    # unambiguous indented-child case is fixed.
     seq_map_re = re.compile(r'^(?P<lead>\s*)-(?P<sp>\s+)("[^"]*"|\'[^\']*\'|[\w\-\.]+)\s*:(\s|$)')
-    # A sequence item with a colon-less "- key value" (missing colon on the
-    # item's first mapping key).
-    seq_cand_re = re.compile(r'^(?P<lead>\s*)-(?P<sp>\s+)(?P<key>[A-Za-z_][A-Za-z0-9_\-\.]*)(\s+)(?P<val>\S.*?)\s*$')
     # A real YAML document marker only lives at column 0 (so indented "---" or
     # "---" sitting inside a block scalar is NOT a marker).
     marker_re = re.compile(r'^(---|\.\.\.)(\s|$)')
@@ -570,16 +576,6 @@ def fix_missing_colon(text: str, result: ValidationResult) -> str:
             inner = len(sm.group("lead")) + 1 + len(sm.group("sp"))
             groups_with_mapping.add((doc_id, idx, inner))
             continue
-
-        if ":" not in line:
-            sc = seq_cand_re.match(line)
-            if sc:
-                inner = len(sc.group("lead")) + 1 + len(sc.group("sp"))
-                key = sc.group("key")
-                replacement = f"{sc.group('lead')}- {key}: {sc.group('val')}"
-                candidates[idx] = (replacement, key, inner + 1)
-                group_of[idx] = (doc_id, idx, inner)
-                continue
 
         # Skip sequence items and anything that already contains a colon.
         if stripped.startswith("-") or ":" in line:
