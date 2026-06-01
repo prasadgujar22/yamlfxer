@@ -424,11 +424,12 @@ def fix_missing_colon(text: str, result: ValidationResult) -> str:
     "name John" (and several such lines fold into one scalar), so a missing
     colon cannot be detected by parsing alone.  To stay high-precision we only
     rewrite a colon-less ``key value`` line when an *explicit* ``key: value``
-    mapping sibling already exists at the **same indentation level** — proof
-    that a mapping was intended there.  Folded plain scalars, scalar values
-    under a block key, and lines whose value merely contains a colon are all
-    left untouched.  The rewrite is additionally applied only if the result
-    still parses, so the file is never made worse.
+    mapping sibling exists in the **same mapping block** — i.e. a true sibling
+    sharing the same document, parent, and indent, not merely the same column
+    somewhere else in the file.  Folded plain scalars, scalar values under a
+    block key, and lines whose value merely contains a colon are all left
+    untouched.  The rewrite is additionally applied only if the result still
+    parses, so the file is never made worse.
     """
     protected = _protected_lines(text)
     lines = text.split("\n")
@@ -440,18 +441,33 @@ def fix_missing_colon(text: str, result: ValidationResult) -> str:
     mapping_re = re.compile(r'^(\s*)([\w\-\.\"\']+)\s*:(\s|$)')
 
     candidates: dict[int, tuple[int, str, str, int]] = {}  # idx → (indent, key, value, keycol)
-    mapping_indents: set[int] = set()
+    group_of: dict[int, tuple] = {}                         # candidate idx → sibling group
+    groups_with_mapping: set[tuple] = set()
 
+    # Walk every structural line, tracking the open-parent stack so each line's
+    # sibling group is (document, parent line, indent).  Mapping evidence is
+    # then scoped to true siblings rather than to a global column width.
+    stack: list[tuple[int, int]] = []  # (indent, line_index) of open parents
+    doc_id = 0
     for idx, line in enumerate(lines):
-        if idx in protected:
-            continue
         stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped in ("---", "..."):
+        if not stripped or stripped.startswith("#"):
+            continue  # blank/comment lines have no structural effect
+        if stripped in ("---", "..."):
+            doc_id += 1   # new document → its own scope
+            stack = []
             continue
         indent = len(line) - len(line.lstrip())
-        # An explicit mapping entry establishes that this indent level is a map.
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1] if stack else None
+        stack.append((indent, idx))
+
+        if idx in protected:
+            continue
+        group = (doc_id, parent, indent)
         if mapping_re.match(line):
-            mapping_indents.add(indent)
+            groups_with_mapping.add(group)   # a real mapping sibling lives here
             continue
         # Skip sequence items and anything that already contains a colon.
         if stripped.startswith("-") or ":" in line:
@@ -459,19 +475,16 @@ def fix_missing_colon(text: str, result: ValidationResult) -> str:
         m = cand_re.match(line)
         if not m:
             continue
-        keycol = len(m.group(1)) + 1
-        candidates[idx] = (indent, m.group(2), m.group(4), keycol)
+        candidates[idx] = (indent, m.group(2), m.group(4), len(m.group(1)) + 1)
+        group_of[idx] = group
 
     if not candidates:
         return text
 
-    # Only fix candidates that sit at an indent where a real mapping sibling
-    # exists — never on the strength of colon-less lines alone (those are
+    # Fix a candidate only when one of its *true siblings* is an explicit
+    # mapping key — never on the strength of colon-less lines alone (those are
     # indistinguishable from a valid folded plain scalar).
-    to_fix = {
-        idx for idx, (indent, *_rest) in candidates.items()
-        if indent in mapping_indents
-    }
+    to_fix = {idx for idx in candidates if group_of[idx] in groups_with_mapping}
     if not to_fix:
         return text
 
