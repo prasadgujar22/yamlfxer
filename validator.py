@@ -582,6 +582,10 @@ def report_file(
         print(red(f"\n  Errors ({len(errors)}):", nc))
         for issue in errors:
             print(red(str(issue), nc))
+        # PyYAML aborts at the first syntax error, so additional structural
+        # problems may be hidden until this one is resolved.
+        print(dim("    (parsing stops at the first error — fix it and re-run "
+                   "to reveal any others)", nc))
 
     if warnings:
         print(yellow(f"\n  Warnings ({len(warnings)}):", nc))
@@ -594,9 +598,19 @@ def report_file(
             print(dim(str(issue), nc))
 
     if result.corrections_made:
-        print(f"\n  {bold('Corrections applied:', nc)}")
+        # Be honest about whether anything is actually written to disk.
+        # A file is only written when --fix or --output is supplied.
+        will_write = bool(getattr(args, "fix", False) or getattr(args, "output", None))
+        header = "Corrections applied:" if will_write else "Corrections available (not written yet):"
+        print(f"\n  {bold(header, nc)}")
         for c in result.corrections_made:
             print(f"    • {c}")
+        if not will_write:
+            hint = _fixed_path(label) if label != "<stdin>" else "<name>.fixed.yaml"
+            print(yellow(f"\n  → Nothing was saved. Re-run with --fix to write the "
+                         f"corrected YAML to {hint}", nc))
+            print(yellow("    (or use --output <file> to choose the path, "
+                         "or --print-corrected to print it).", nc))
 
     if not result.issues and not result.corrections_made:
         print(f"  {dim('No issues found.', nc)}")
@@ -652,6 +666,9 @@ def process_file(
             with open(out_path, "w", encoding="utf-8") as fh:
                 fh.write(corrected)
             print(f"\n  Wrote corrected YAML → {out_path}")
+            if not result.valid:
+                print("  ⚠ Note: auto-correction could not fully fix this file — "
+                      "the written copy still has errors that need manual edits.")
 
     return result
 
