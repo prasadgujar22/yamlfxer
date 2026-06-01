@@ -643,9 +643,9 @@ def process_file(
             else:
                 out_path = "fixed.yaml"  # stdin fallback
 
-            # Safety: never overwrite the original input file.
+            # Safety: never overwrite the original input file (resolve symlinks too).
             if (source_path and source_path != "<stdin>"
-                    and os.path.abspath(out_path) == os.path.abspath(source_path)):
+                    and os.path.realpath(out_path) == os.path.realpath(source_path)):
                 out_path = _fixed_path(source_path)
                 print("\n  (refusing to overwrite the original — using a separate file)")
 
