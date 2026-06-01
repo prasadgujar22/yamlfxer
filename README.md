@@ -16,6 +16,7 @@ A Python CLI tool that validates YAML files and auto-corrects common mistakes.
   keys or list items)
 - Trailing whitespace removal
 - Missing space after colon (`key:value` → `key: value`)
+- **Missing colon entirely** (`name John` → `name: John`) — context-aware, see note below
 - Bare colon in values → quoted (`title: Hello: World` → `title: "Hello: World"`)
 - Duplicate keys in the same mapping block (context-aware)
 - Missing newline at end of file
@@ -27,6 +28,14 @@ A Python CLI tool that validates YAML files and auto-corrects common mistakes.
 > but for deeply ambiguous cases (especially sequences of mappings) the chosen
 > structure may not match your intent, so review the generated `.fixed` file
 > before using it.
+
+> **About missing colons:** YAML reads `name John` as the plain string
+> `"name John"`, not a broken mapping — so a missing colon can't be detected by
+> parsing alone. The tool flags one only when context shows a mapping was
+> intended: several colon-less `key value` lines share an indentation level, or
+> a properly-written `key: value` sibling sits at the same level. A lone
+> multi-word line (e.g. a real scalar value under a block key) is left untouched,
+> and the rewrite is applied only if the result still parses.
 
 ## Installation
 
@@ -83,6 +92,7 @@ python validator.py config.yaml --strict
 | `W003` | warning | Value treated as boolean in YAML 1.1 |
 | `W004` | warning | Octal-looking integer |
 | `W005` | warning | Missing space after colon (`key:value`) |
+| `W006` | warning | Missing colon after key (`name John`) |
 | `I001` | info    | Line longer than 120 characters |
 
 ## Example
