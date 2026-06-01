@@ -11,11 +11,22 @@ A Python CLI tool that validates YAML files and auto-corrects common mistakes.
 **Auto-corrections**
 - Windows line endings → Unix (CRLF → LF)
 - Tab indentation → 2-space indentation
+- **Broken / inconsistent indentation** → re-indented to consistent 2-space levels
+  (fixes odd widths like 1/3/5 spaces, mixed tabs+spaces, and under/over-indented
+  keys or list items)
 - Trailing whitespace removal
 - Missing space after colon (`key:value` → `key: value`)
 - Bare colon in values → quoted (`title: Hello: World` → `title: "Hello: World"`)
 - Duplicate keys in the same mapping block (context-aware)
 - Missing newline at end of file
+
+> **About indentation repair:** YAML indentation is *semantic*, so repair is
+> necessarily heuristic. The tool reconstructs nesting from the relative indent
+> of each line and re-emits clean 2-space levels. It only applies the rewrite if
+> the result parses, so it will never replace your file with *unparseable* YAML —
+> but for deeply ambiguous cases (especially sequences of mappings) the chosen
+> structure may not match your intent, so review the generated `.fixed` file
+> before using it.
 
 ## Installation
 
