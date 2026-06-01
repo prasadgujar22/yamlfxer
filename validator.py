@@ -421,22 +421,26 @@ def fix_missing_colon(text: str, result: ValidationResult) -> str:
     written without one (e.g. ``name John`` → ``name: John``).
 
     This is heuristic: YAML happily reads ``name John`` as the plain string
-    "name John", so we only treat a line as a broken mapping entry when the
-    surrounding context shows a mapping is intended — either several such lines
-    share an indentation level, or a properly-colon'd sibling sits at the same
-    level.  A lone multi-word line under a block key (a legitimate scalar value)
-    is therefore left alone.  The rewrite is applied only if the result still
-    parses as valid YAML, so the file is never made worse.
+    "name John" (and several such lines fold into one scalar), so a missing
+    colon cannot be detected by parsing alone.  To stay high-precision we only
+    rewrite a colon-less ``key value`` line when an *explicit* ``key: value``
+    mapping sibling already exists at the **same indentation level** — proof
+    that a mapping was intended there.  Folded plain scalars, scalar values
+    under a block key, and lines whose value merely contains a colon are all
+    left untouched.  The rewrite is additionally applied only if the result
+    still parses, so the file is never made worse.
     """
     protected = _protected_lines(text)
     lines = text.split("\n")
 
     # A bare "<key> <value>" line: identifier-like key, whitespace, then a value.
     cand_re = re.compile(r'^(\s*)([A-Za-z_][A-Za-z0-9_\-\.]*)(\s+)(\S.*?)\s*$')
+    # An explicit mapping key: anchored "<key>:" with a space or end-of-line
+    # after the colon (so "note Hello: world" is NOT counted as a mapping).
+    mapping_re = re.compile(r'^(\s*)([\w\-\.\"\']+)\s*:(\s|$)')
 
     candidates: dict[int, tuple[int, str, str, int]] = {}  # idx → (indent, key, value, keycol)
-    cand_indent_counts: dict[int, int] = {}
-    proper_indents: set[int] = set()
+    mapping_indents: set[int] = set()
 
     for idx, line in enumerate(lines):
         if idx in protected:
@@ -444,10 +448,10 @@ def fix_missing_colon(text: str, result: ValidationResult) -> str:
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or stripped in ("---", "..."):
             continue
-        indent = len(line) - len(line.lstrip(" "))
-        # Already a mapping entry? (colon + space, or a key-only block opener)
-        if ": " in line or stripped.endswith(":"):
-            proper_indents.add(indent)
+        indent = len(line) - len(line.lstrip())
+        # An explicit mapping entry establishes that this indent level is a map.
+        if mapping_re.match(line):
+            mapping_indents.add(indent)
             continue
         # Skip sequence items and anything that already contains a colon.
         if stripped.startswith("-") or ":" in line:
@@ -457,14 +461,16 @@ def fix_missing_colon(text: str, result: ValidationResult) -> str:
             continue
         keycol = len(m.group(1)) + 1
         candidates[idx] = (indent, m.group(2), m.group(4), keycol)
-        cand_indent_counts[indent] = cand_indent_counts.get(indent, 0) + 1
 
     if not candidates:
         return text
 
+    # Only fix candidates that sit at an indent where a real mapping sibling
+    # exists — never on the strength of colon-less lines alone (those are
+    # indistinguishable from a valid folded plain scalar).
     to_fix = {
         idx for idx, (indent, *_rest) in candidates.items()
-        if cand_indent_counts[indent] >= 2 or indent in proper_indents
+        if indent in mapping_indents
     }
     if not to_fix:
         return text
