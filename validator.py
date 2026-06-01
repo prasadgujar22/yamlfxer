@@ -439,6 +439,9 @@ def fix_missing_colon(text: str, result: ValidationResult) -> str:
     # An explicit mapping key: anchored "<key>:" with a space or end-of-line
     # after the colon (so "note Hello: world" is NOT counted as a mapping).
     mapping_re = re.compile(r'^(\s*)([\w\-\.\"\']+)\s*:(\s|$)')
+    # A real YAML document marker only lives at column 0 (so indented "---" or
+    # "---" sitting inside a block scalar is NOT a marker).
+    marker_re = re.compile(r'^(---|\.\.\.)(\s|$)')
 
     candidates: dict[int, tuple[int, str, str, int]] = {}  # idx → (indent, key, value, keycol)
     group_of: dict[int, tuple] = {}                         # candidate idx → sibling group
@@ -450,21 +453,23 @@ def fix_missing_colon(text: str, result: ValidationResult) -> str:
     stack: list[tuple[int, int]] = []  # (indent, line_index) of open parents
     doc_id = 0
     for idx, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue  # blank/comment lines have no structural effect
-        if stripped in ("---", "..."):
+        # Block-scalar content is literal text — it must not affect document
+        # scope or the parent stack (e.g. a "---" line inside a "|" block).
+        if idx in protected:
+            continue
+        if marker_re.match(line):
             doc_id += 1   # new document → its own scope
             stack = []
             continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue  # blank/comment lines have no structural effect
         indent = len(line) - len(line.lstrip())
         while stack and stack[-1][0] >= indent:
             stack.pop()
         parent = stack[-1][1] if stack else None
         stack.append((indent, idx))
 
-        if idx in protected:
-            continue
         group = (doc_id, parent, indent)
         if mapping_re.match(line):
             groups_with_mapping.add(group)   # a real mapping sibling lives here
