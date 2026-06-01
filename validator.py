@@ -415,6 +415,85 @@ def fix_broken_indentation(text: str, result: ValidationResult) -> str:
     return text  # re-indent didn't yield valid YAML — leave the file untouched
 
 
+def fix_missing_colon(text: str, result: ValidationResult) -> str:
+    """
+    Insert a missing key/value colon on lines that look like a mapping entry
+    written without one (e.g. ``name John`` → ``name: John``).
+
+    This is heuristic: YAML happily reads ``name John`` as the plain string
+    "name John", so we only treat a line as a broken mapping entry when the
+    surrounding context shows a mapping is intended — either several such lines
+    share an indentation level, or a properly-colon'd sibling sits at the same
+    level.  A lone multi-word line under a block key (a legitimate scalar value)
+    is therefore left alone.  The rewrite is applied only if the result still
+    parses as valid YAML, so the file is never made worse.
+    """
+    protected = _protected_lines(text)
+    lines = text.split("\n")
+
+    # A bare "<key> <value>" line: identifier-like key, whitespace, then a value.
+    cand_re = re.compile(r'^(\s*)([A-Za-z_][A-Za-z0-9_\-\.]*)(\s+)(\S.*?)\s*$')
+
+    candidates: dict[int, tuple[int, str, str, int]] = {}  # idx → (indent, key, value, keycol)
+    cand_indent_counts: dict[int, int] = {}
+    proper_indents: set[int] = set()
+
+    for idx, line in enumerate(lines):
+        if idx in protected:
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped in ("---", "..."):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        # Already a mapping entry? (colon + space, or a key-only block opener)
+        if ": " in line or stripped.endswith(":"):
+            proper_indents.add(indent)
+            continue
+        # Skip sequence items and anything that already contains a colon.
+        if stripped.startswith("-") or ":" in line:
+            continue
+        m = cand_re.match(line)
+        if not m:
+            continue
+        keycol = len(m.group(1)) + 1
+        candidates[idx] = (indent, m.group(2), m.group(4), keycol)
+        cand_indent_counts[indent] = cand_indent_counts.get(indent, 0) + 1
+
+    if not candidates:
+        return text
+
+    to_fix = {
+        idx for idx, (indent, *_rest) in candidates.items()
+        if cand_indent_counts[indent] >= 2 or indent in proper_indents
+    }
+    if not to_fix:
+        return text
+
+    new_lines = list(lines)
+    issues: list[Issue] = []
+    for idx in sorted(to_fix):
+        indent, key, value, keycol = candidates[idx]
+        new_lines[idx] = f"{' ' * indent}{key}: {value}"
+        issues.append(Issue(
+            line=idx + 1,
+            column=keycol,
+            severity="warning",
+            code="W006",
+            message=f"Missing colon after key '{key}'",
+            suggestion="A mapping entry needs a colon, e.g. 'key: value'",
+        ))
+
+    candidate = "\n".join(new_lines)
+    if not _parses(candidate):
+        return text  # couldn't safely turn this into valid YAML — leave it alone
+
+    result.issues.extend(issues)
+    result.corrections_made.append(
+        f"Inserted missing colon in {len(to_fix)} key-value pair(s)"
+    )
+    return candidate
+
+
 # ─────────────────────────────────────────────
 # Core validate + correct pipeline
 # ─────────────────────────────────────────────
@@ -424,6 +503,7 @@ CORRECTORS = [
     fix_tabs,
     fix_trailing_whitespace,
     fix_missing_space_after_colon,
+    fix_missing_colon,
     fix_unquoted_colon_in_value,
     fix_broken_indentation,
     fix_duplicate_keys,
