@@ -57,15 +57,21 @@ class ValidationResult:
 # ─────────────────────────────────────────────
 
 def fix_tabs(text: str, result: ValidationResult) -> str:
-    """Replace tab indentation with 2 spaces."""
+    """
+    Replace tabs used for indentation with 2 spaces.
+
+    Handles tabs anywhere in the *leading* whitespace of a line — not just at
+    column 0 — so mixed indentation like ``"  \\tkey:"`` (spaces then a tab) is
+    normalized too.  Tabs inside values are left untouched.
+    """
     lines = text.splitlines(keepends=True)
     changed = False
     out = []
-    for i, line in enumerate(lines, 1):
-        stripped = line.lstrip("\t")
-        n_tabs = len(line) - len(stripped)
-        if n_tabs:
-            line = "  " * n_tabs + stripped
+    for line in lines:
+        stripped = line.lstrip(" \t")
+        indent = line[: len(line) - len(stripped)]
+        if "\t" in indent:
+            line = indent.replace("\t", "  ") + stripped
             changed = True
         out.append(line)
     if changed:
@@ -330,6 +336,85 @@ def lint(text: str, result: ValidationResult) -> None:
             ))
 
 
+def fix_broken_indentation(text: str, result: ValidationResult) -> str:
+    """
+    Repair inconsistent / broken indentation.
+
+    YAML indentation is semantic, so this is necessarily heuristic.  We walk the
+    document tracking *relative* nesting — a line indented more than the previous
+    significant line is a child; an equal indent is a sibling; a smaller indent
+    dedents to a matching ancestor — and re-emit every line at a clean,
+    consistent 2-spaces-per-level indent.  This repairs the most common breakage:
+    odd indent widths (1, 3, 5 spaces), mixed widths, and over/under-indented
+    keys or list items.
+
+    The rewrite is applied ONLY if the result parses as valid YAML, so the file
+    is never made worse: if the heuristic can't produce something valid, the
+    original text is returned untouched and the safety net elsewhere takes over.
+    """
+    if _parses(text):
+        return text  # structure already valid — don't disturb it
+
+    lines = text.split("\n")
+    protected = _protected_lines(text)
+
+    out: list[str] = []
+    raw_levels: Optional[list[int]] = None  # raw indent width per logical depth
+    prev_opens_block = False  # did the previous significant line open a child block?
+    changed = False
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        # Leave blank lines, comments and block-scalar content exactly as-is.
+        if idx in protected or stripped == "" or stripped.startswith("#"):
+            out.append(line)
+            continue
+
+        raw_indent = len(line) - len(line.lstrip(" "))
+        content = line.lstrip(" ")
+
+        if raw_levels is None:
+            # Anchor depth 0 to the first significant line's indent, so a
+            # uniformly over-indented document is pulled back to column 0.
+            raw_levels = [raw_indent]
+        elif raw_indent > raw_levels[-1] and prev_opens_block:
+            # Deeper than the previous line, AND that line can actually hold
+            # children (it ended with ':' or was a bare '-') → real nesting.
+            raw_levels.append(raw_indent)
+        else:
+            # Otherwise realign to the NEAREST existing level instead of
+            # inventing a new one.  This repairs a sibling that was accidentally
+            # under/over-indented (e.g. 3 spaces where 2 were meant), since a
+            # key with an inline value cannot legally have deeper children.
+            # Ties break toward the deeper level (closer sibling).
+            best_depth, best_dist = 0, abs(raw_levels[0] - raw_indent)
+            for d in range(1, len(raw_levels)):
+                dist = abs(raw_levels[d] - raw_indent)
+                if dist <= best_dist:
+                    best_dist, best_depth = dist, d
+            del raw_levels[best_depth + 1:]
+
+        depth = len(raw_levels) - 1
+        new_line = "  " * depth + content
+        if new_line != line:
+            changed = True
+        out.append(new_line)
+
+        # A line opens a child block if it ends with a colon (`key:`, `- key:`)
+        # or is a bare sequence dash (`-`) — i.e. it has no inline scalar value.
+        no_comment = re.split(r"\s+#", stripped, maxsplit=1)[0].rstrip()
+        prev_opens_block = no_comment.endswith(":") or no_comment == "-"
+
+    if not changed:
+        return text
+
+    candidate = "\n".join(out)
+    if _parses(candidate):
+        result.corrections_made.append("Normalized inconsistent indentation")
+        return candidate
+    return text  # re-indent didn't yield valid YAML — leave the file untouched
+
+
 # ─────────────────────────────────────────────
 # Core validate + correct pipeline
 # ─────────────────────────────────────────────
@@ -340,6 +425,7 @@ CORRECTORS = [
     fix_trailing_whitespace,
     fix_missing_space_after_colon,
     fix_unquoted_colon_in_value,
+    fix_broken_indentation,
     fix_duplicate_keys,
     fix_missing_newline_at_eof,
 ]
